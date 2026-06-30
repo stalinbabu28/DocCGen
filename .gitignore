@@ -24,3 +24,5 @@ generated_meta/
 .cache/
 
 *.DS_Store
+
+EVAL_HARNESS_GUIDE.md
