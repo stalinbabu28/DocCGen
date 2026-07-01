@@ -5,6 +5,7 @@ import os
 from llama_cpp import LlamaGrammar
 
 from pipeline.dynamic_decoder import generate_dynamic_yaml
+from pipeline.parser_state_decoder import generate_parser_state_yaml
 from pipeline.trigger_rules import infer_active_fields, project_schema
 from pipeline.value_hints import infer_value_hints
 from pipeline.yaml_grammar_builder import build_yaml_grammar
@@ -22,6 +23,14 @@ def generate_constrained_yaml(
     module_fqn: str,
     max_tokens: int = 128,
 ) -> str:
+    if os.getenv("USE_PARSER_STATE_DECODER", "0") == "1":
+        return generate_parser_state_yaml(
+            query=query,
+            schema=schema,
+            module_fqn=module_fqn,
+            max_tokens=max_tokens,
+        )
+
     if os.getenv("USE_DYNAMIC_DECODER", "0") == "1":
         return generate_dynamic_yaml(
             query=query,
