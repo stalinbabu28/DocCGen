@@ -60,12 +60,10 @@ def _query_has_resource_hint(query: str) -> bool:
 def build_prompt(query: str, candidates: List[dict]) -> str:
     lines = []
     for i, cand in enumerate(candidates, 1):
-        lines.append(
-            f"{i}. {cand['module_fqn']} — {cand.get('short_description', '').strip()}"
-        )
+        lines.append(f"{i}. {cand['module_fqn']} — {cand.get('short_description', '').strip()}")
 
     prompt = f"""
-You choose the single best Azure Ansible module for a user request.
+You choose the single best Ansible module for a user request.
 
 Return ONLY one exact module name from the candidate list.
 Do not explain.
@@ -73,7 +71,7 @@ Do not add markdown.
 Do not add code fences.
 Do not add any extra text.
 
-Prefer the primary resource module over *_info, *instance, *extension, *link, and *group variants unless the user explicitly asks for those concepts.
+Prefer the primary module over *_info, *facts, *instance, *extension, *link, and *group variants unless the user explicitly asks for those concepts.
 
 User request:
 {query}
@@ -121,11 +119,8 @@ def choose_module(query: str, candidates: List[dict], max_tokens: int = 64) -> d
         candidates,
         key=lambda c: (c.get("final_score", c.get("score", 0.0)), c.get("score", 0.0)),
     )
-    sorted_scores = sorted(
-        (c.get("final_score", c.get("score", 0.0)) for c in candidates),
-        reverse=True,
-    )
-    second_score = sorted_scores[1] if len(sorted_scores) > 1 else float("-inf")
+    scores = sorted((c.get("final_score", c.get("score", 0.0)) for c in candidates), reverse=True)
+    second_score = scores[1] if len(scores) > 1 else float("-inf")
 
     if _query_has_resource_hint(query) or _query_has_info_cue(query):
         if best.get("final_score", best.get("score", 0.0)) >= second_score + 1.0:
@@ -142,18 +137,11 @@ def choose_module(query: str, candidates: List[dict], max_tokens: int = 64) -> d
         prompt,
         max_tokens=max_tokens,
         temperature=0,
-        stop=[
-            "<|end|>",
-            "<|start|>",
-            "\n\n",
-        ],
+        stop=["<|end|>", "<|start|>", "\n\n"],
     )
 
     raw = response["choices"][0]["text"]
-    choice = _extract_choice(raw, candidates)
-
-    if choice is None:
-        choice = candidates[0]["module_fqn"]
+    choice = _extract_choice(raw, candidates) or candidates[0]["module_fqn"]
 
     for cand in candidates:
         if cand["module_fqn"] == choice:

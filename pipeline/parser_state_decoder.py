@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from llama_cpp import LlamaGrammar
 
+from pipeline.decoder_time_triggers import DecoderTimeTriggerEngine
 from pipeline.llm import get_llm
 from pipeline.parser_state import FieldKind, ParserMode, ParserState
 from pipeline.trigger_rules import infer_active_fields, project_schema
@@ -24,21 +25,31 @@ class TemplatePiece:
     terminal_for_field: bool = True
 
 
-class Phase2ParserStateDecoder:
+class Phase3ParserStateDecoder:
     """
-    Phase 2: parser-state template mutation.
+    Phase 3: decoder-time trigger engine.
 
-    This decoder mutates templates by parser state:
-    - HEADER
-    - SCALAR field
-    - LIST header -> LIST item(s)
-    - DICT header -> DICT pair(s)
+    This decoder keeps Phase 2's parser-state mutation, but structural triggers
+    now fire on emitted YAML structure:
+    - header emission
+    - entering list bodies
+    - emitting list items
+    - entering dict bodies
+    - emitting dict pairs
+    - indentation mismatch detection
 
-    It is still line/block-level, not full token-level backtracking.
+    Phase 4 will add recovery/backtracking for invalid indentation.
     """
 
     def __init__(self):
-        self.llm = get_llm()
+        # Lazy-load the model only if a piece actually needs it.
+        self._llm = None
+        self.trigger_engine = DecoderTimeTriggerEngine()
+
+    def _get_llm(self):
+        if self._llm is None:
+            self._llm = get_llm()
+        return self._llm
 
     def _yaml_atom(self, value: Any) -> str:
         if isinstance(value, bool):
@@ -50,7 +61,7 @@ class Phase2ParserStateDecoder:
         return json.dumps(text)
 
     def _exact_grammar(self, text: str) -> str:
-        return f"root ::= {json.dumps(text)}"
+        return f'root ::= {json.dumps(text)}'
 
     def _ordered_fields(self, schema: Dict[str, Any], active_fields: List[str]) -> List[str]:
         required = [f for f in schema.get("required", []) if f in active_fields]
@@ -116,7 +127,7 @@ class Phase2ParserStateDecoder:
                 label=f"{field}:scalar-direct",
                 grammar_text=self._exact_grammar(text),
                 max_tokens=16,
-                kind="scalar",
+                kind="scalar-direct",
                 direct_text=text,
                 field=field,
             )
@@ -136,7 +147,6 @@ class Phase2ParserStateDecoder:
         ctx = state.current
 
         if not ctx.started:
-            # First mutation: enter list template.
             if isinstance(ctx.hint, list) and ctx.hint:
                 text = f"    {field}:\n"
                 return TemplatePiece(
@@ -149,7 +159,6 @@ class Phase2ParserStateDecoder:
                     terminal_for_field=False,
                 )
 
-            # Unknown list: fall back to whole-block grammar.
             grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
             return TemplatePiece(
                 label=f"{field}:list-block",
@@ -159,7 +168,6 @@ class Phase2ParserStateDecoder:
                 field=field,
             )
 
-        # List items after the header.
         if isinstance(ctx.hint, list) and ctx.item_index < len(ctx.hint):
             item = ctx.hint[ctx.item_index]
             text = f"        - {self._yaml_atom(item)}\n"
@@ -188,7 +196,6 @@ class Phase2ParserStateDecoder:
         ctx = state.current
 
         if not ctx.started:
-            # First mutation: enter dict template.
             if isinstance(ctx.hint, dict) and ctx.hint:
                 text = f"    {field}:\n"
                 return TemplatePiece(
@@ -210,8 +217,8 @@ class Phase2ParserStateDecoder:
                 field=field,
             )
 
-        if isinstance(ctx.hint, dict) and ctx.pair_index < len(ctx.pairs):
-            key, value = ctx.pairs[ctx.pair_index]
+        if isinstance(ctx.hint, dict) and ctx.pair_index < len(ctx.hint):
+            key, value = list(ctx.hint.items())[ctx.pair_index]
             text = f"        {key}: {self._yaml_atom(value)}\n"
             return TemplatePiece(
                 label=f"{field}:pair-{ctx.pair_index + 1}",
@@ -220,7 +227,7 @@ class Phase2ParserStateDecoder:
                 kind="dict-pair",
                 direct_text=text,
                 field=field,
-                terminal_for_field=(ctx.pair_index == len(ctx.pairs) - 1),
+                terminal_for_field=(ctx.pair_index == len(ctx.hint) - 1),
             )
 
         grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
@@ -250,60 +257,13 @@ class Phase2ParserStateDecoder:
 
         return self._scalar_piece(state)
 
-    def _advance_state_after_piece(self, state: ParserState, piece: TemplatePiece) -> None:
-        ctx = state.current
-        if ctx is None:
-            if piece.kind == "header":
-                state.mode = ParserMode.FIELD_SELECT
-            return
-
-        if piece.kind == "header":
-            state.mode = ParserMode.FIELD_SELECT
-            return
-
-        if piece.kind == "scalar":
-            state.finish_current_field()
-            return
-
-        if piece.kind == "list-header":
-            ctx.started = True
-            state.mode = ParserMode.LIST_ITEMS
-            return
-
-        if piece.kind == "list-item":
-            ctx.item_index += 1
-            if isinstance(ctx.hint, list) and ctx.item_index >= len(ctx.hint):
-                state.finish_current_field()
-            else:
-                state.mode = ParserMode.LIST_ITEMS
-            return
-
-        if piece.kind == "list-block":
-            state.finish_current_field()
-            return
-
-        if piece.kind == "dict-header":
-            ctx.started = True
-            state.mode = ParserMode.DICT_ITEMS
-            return
-
-        if piece.kind == "dict-pair":
-            ctx.pair_index += 1
-            if isinstance(ctx.hint, dict) and ctx.pair_index >= len(ctx.hint):
-                state.finish_current_field()
-            else:
-                state.mode = ParserMode.DICT_ITEMS
-            return
-
-        if piece.kind == "dict-block":
-            state.finish_current_field()
-            return
-
-        state.finish_current_field()
-
     def _emit_piece(self, query: str, output: str, piece: TemplatePiece) -> str:
+        # Deterministic path: no model needed.
         if piece.direct_text is not None:
             return piece.direct_text
+
+        # Only load the model when grammar-constrained decoding is truly required.
+        llm = self._get_llm()
 
         prompt = f"""
 You are generating an Ansible YAML task.
@@ -326,7 +286,7 @@ YAML:
 """.strip()
 
         grammar = LlamaGrammar.from_string(piece.grammar_text)
-        response = self.llm(
+        response = llm(
             prompt,
             grammar=grammar,
             temperature=0,
@@ -363,6 +323,8 @@ YAML:
         header = f"- name: Generated Task\n  {module_fqn}:\n"
         state.output = header
         state.mark_emitted("header")
+        state.record_trigger_event("fire:header_emitted")
+        state.switch_template(f"module:{module_fqn}")
         state.mode = ParserMode.FIELD_SELECT
 
         if debug:
@@ -373,6 +335,7 @@ YAML:
             print("ACTIVE FIELDS:", state.active_fields)
             print("VALUE HINTS:", state.value_hints)
             print("ORDERED FIELDS:", state.ordered_fields)
+            print("CURRENT TEMPLATE:", state.current_template())
 
         budget_left = max_tokens
 
@@ -394,6 +357,7 @@ YAML:
                 print("=" * 100)
                 print(f"STATE FIELD: {state.current_field_name()}")
                 print(f"PIECE: {piece.label}")
+                print("CURRENT TEMPLATE:", state.current_template())
                 print("GRAMMAR:")
                 print(piece.grammar_text)
                 print("OUTPUT SO FAR:")
@@ -404,13 +368,29 @@ YAML:
             state.mark_emitted(piece.label)
             budget_left -= piece.max_tokens
 
+            events = self.trigger_engine.apply(
+                state=state,
+                piece_kind=piece.kind,
+                piece_label=piece.label,
+                generated=generated,
+                debug=debug,
+            )
+
             if debug:
                 print("GENERATED PIECE:")
                 print(repr(generated))
+                print("TRIGGER EVENTS:")
+                print([e.kind.name for e in events])
                 print("FULL OUTPUT:")
                 print(state.output)
-
-            self._advance_state_after_piece(state, piece)
+                print("PARSER LOG:")
+                print(state.parser_log)
+                print("DECODER LOG:")
+                print(state.decoder_log)
+                print("TRIGGER LOG:")
+                print(state.trigger_log)
+                print("TEMPLATE STACK:")
+                print(state.template_stack)
 
         result = state.output.rstrip()
 
@@ -420,12 +400,20 @@ YAML:
                 "active_fields": state.active_fields,
                 "ordered_fields": state.ordered_fields,
                 "value_hints": state.value_hints,
+                "parser_log": state.parser_log,
+                "decoder_log": state.decoder_log,
+                "trigger_log": state.trigger_log,
                 "transition_log": state.transition_log,
-                "switch_count": len([x for x in state.transition_log if x.startswith("emit:")]),
+                "template_stack": state.template_stack,
+                "current_indent": state.current_indent,
+                "switch_count": len([x for x in state.trigger_log if x.startswith("fire:")]),
                 "output": result,
             }
 
         return result
+
+
+Phase2ParserStateDecoder = Phase3ParserStateDecoder
 
 
 def generate_parser_state_yaml(
@@ -436,7 +424,7 @@ def generate_parser_state_yaml(
     debug: bool = False,
     return_metadata: bool = False,
 ):
-    decoder = Phase2ParserStateDecoder()
+    decoder = Phase3ParserStateDecoder()
     return decoder.decode(
         query=query,
         schema=schema,

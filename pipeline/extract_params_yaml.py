@@ -23,7 +23,7 @@ def generate_constrained_yaml(
     module_fqn: str,
     max_tokens: int = 128,
 ) -> str:
-    if os.getenv("USE_PARSER_STATE_DECODER", "0") == "1":
+    if os.getenv("USE_PHASE3_DECODER", "0") == "1":
         return generate_parser_state_yaml(
             query=query,
             schema=schema,

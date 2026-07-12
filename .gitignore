@@ -11,6 +11,29 @@ outputs/
 generated_yaml/
 generated_meta/
 
+benchmark_all.jsonl
+benchmark_all_repaired.jsonl
+
+colbert_data/
+colbert_ft/
+
+evaluation/benchmark_test10/
+evaluation/benchmark_test100/
+evaluation/benchmark_test10_colbert/
+evaluation/benchmark_test100_colbert/
+evaluation/colbert_ft100/
+evaluation/colbert_zero100/
+evaluation/hybrid100/
+evaluation/phase3_corpus_full/
+evaluation/phase3_corpus_sample/
+evaluation/retrieval_test/
+
+experiments/
+
+hfdoccgen_environment.yml
+
+phase3withcolbert_backup.tar.gz
+
 *.log
 
 *.txt

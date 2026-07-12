@@ -1,26 +1,34 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
-import re
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Dict, List, Optional
 
-NAME_RE = r"[A-Za-z0-9._/-]+(?:\.[A-Za-z0-9._/-]+)*"
+from pipeline.schema_text_utils import (
+    collapse_ws,
+    field_phrases,
+    is_info_module,
+    normalize_type,
+    phrase_in_query,
+    unique,
+)
 
 DELETE_CUES = (" delete ", " remove ", " absent ")
-INFO_CUES = (" show ", " details ", " information ", " info ", " get ", " list ", " display ", " describe ")
+BOOL_CUES = (" true ", " false ", " yes ", " no ", " 1 ", " 0 ", " on ", " off ", " enabled ", " disabled ")
 
-SENSITIVE_FIELDS = {
-    "name",
-    "resource_group",
-    "state",
-    "tags",
-    "append_tags",
-    "dns_servers",
-    "virtual_network_name",
-    "virtual_network",
-    "subnet_name",
-    "location",
+SPECIAL_LISTISH_WORDS = {
+    "list", "items", "item", "servers", "addresses", "names", "ids", "resources",
+    "entries", "subnets", "rules", "neighbors", "trail_names", "networks", "ranges"
+}
+
+SPECIAL_DICTISH_WORDS = {
+    "tags", "tag", "labels", "label", "annotations", "metadata",
+    "options", "settings", "parameters", "args", "arguments", "attributes", "properties"
+}
+
+GENERIC_NAME_FIELDS = {
+    "name", "resource_group", "location", "region", "subnet_name",
+    "virtual_network_name", "virtual_network", "path", "src", "dest", "url", "line"
 }
 
 
@@ -28,122 +36,69 @@ def _has_any(text: str, phrases) -> bool:
     return any(p in text for p in phrases)
 
 
-def _is_info_module(module_fqn: Optional[str]) -> bool:
-    return bool(module_fqn and module_fqn.endswith("_info"))
+def _explicit_resource_group_trigger(query: str) -> bool:
+    return phrase_in_query(query, "resource group")
 
 
-def _has_tags_kv(query: str) -> bool:
-    if re.search(r"\b(?:with\s+)?tags?\b", query, flags=re.IGNORECASE) is None:
-        return False
-
-    if re.search(r"\bappend\s+tags\b", query, flags=re.IGNORECASE):
-        # "append tags false" should not activate tags
-        if not re.search(r"\b(?:with\s+)?tags?\b.*\b[A-Za-z0-9._/-]+\s+[A-Za-z0-9._/-]+\b", query, flags=re.IGNORECASE | re.DOTALL):
-            return False
-
-    m = re.search(r"\b(?:with\s+)?tags?\b(.*)$", query, flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return False
-
-    segment = m.group(1)
-    if re.search(r"\bappend\s+tags\b", segment, flags=re.IGNORECASE):
-        segment = re.split(r"\band\s+append\s+tags\b", segment, maxsplit=1, flags=re.IGNORECASE)[0]
-
-    if re.search(r"([A-Za-z0-9._/-]+)\s*[:=]\s*([A-Za-z0-9._/-]+)", segment):
-        return True
-
-    tokens = re.findall(r"[A-Za-z0-9._/-]+", segment)
-    tokens = [t for t in tokens if t.lower() not in {"and", "with", "tags", "tag", "append", "true", "false", "yes", "no"}]
-    return len(tokens) >= 4
-
-
-def _generic_field_trigger(field: str, query: str) -> bool:
-    if field in SENSITIVE_FIELDS:
-        return False
-
-    phrase = field.replace("_", " ")
-    patterns = [
-        rf"\b{re.escape(phrase)}\s+(?:called|named|with|of|to|from|in|for)\s+({NAME_RE})",
-        rf"\b{re.escape(phrase)}\s+({NAME_RE})",
-    ]
-    return any(re.search(p, query, flags=re.IGNORECASE) for p in patterns)
+def _explicit_state_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return any(cue in f" {q} " for cue in DELETE_CUES)
 
 
 def _explicit_name_trigger(query: str) -> bool:
-    patterns = [
-        rf"\bdelete\s+subnet\s+({NAME_RE})",
-        rf"\b(?:create|delete|show|get|list|update)\s+a?\s*subnet\s+(?:called\s+|named\s+)?({NAME_RE})",
-        rf"\b(?:virtual network gateway|virtual network|dns zone|public ip address|route table|storage account|managed disk|load balancer|application gateway|web app|network interface|virtual machine scale set|virtual machine|aks cluster|container registry|key vault|sql database|sql server)\s+(?:called\s+|named\s+)?({NAME_RE})",
-        rf"\b(?:show details of|get information about|list|display|describe)\s+(?:a|an|the)?\s*(?:virtual network gateway|virtual network|dns zone|public ip address|route table|storage account|managed disk|load balancer|application gateway|web app|network interface|virtual machine scale set|virtual machine|aks cluster|container registry|key vault|sql database|sql server)\s+({NAME_RE})",
-        rf"\bnamed\s+({NAME_RE})",
-        rf"\bcalled\s+({NAME_RE})",
-    ]
-    return any(re.search(p, query, flags=re.IGNORECASE) for p in patterns)
+    q = collapse_ws(query)
+    return phrase_in_query(q, "named") or phrase_in_query(q, "called") or phrase_in_query(q, "name ")
 
 
-def _explicit_resource_group_trigger(query: str) -> bool:
-    return re.search(r"\bresource group\s+([A-Za-z0-9._/-]+)", query, flags=re.IGNORECASE) is not None
-
-
-def _explicit_subnet_name_trigger(query: str) -> bool:
-    patterns = [
-        rf"\bdelete\s+subnet\s+({NAME_RE})",
-        rf"\b(?:create|delete|show|get|list|update)\s+a?\s*subnet\s+(?:called\s+|named\s+)?({NAME_RE})",
-        rf"\bsubnet\s+(?:called\s+|named\s+)?({NAME_RE})",
-    ]
-    return any(re.search(p, query, flags=re.IGNORECASE) for p in patterns)
-
-
-def _explicit_virtual_network_name_trigger(query: str) -> bool:
-    patterns = [
-        rf"\b(?:in|on|with|to|attached to)\s+virtual network\s+({NAME_RE})",
-        rf"\bvirtual network\s+(?:called\s+|named\s+)?({NAME_RE})",
-    ]
-    # Exclude phrases like "virtual network gateway" from being treated as a VNet name.
-    for p in patterns:
-        m = re.search(p, query, flags=re.IGNORECASE)
-        if m and m.group(1).lower() != "gateway":
-            return True
-    return False
-
-
-def _explicit_virtual_network_value_trigger(query: str) -> bool:
-    patterns = [
-        rf"\b(?:in|on|with|to|attached to)\s+virtual network\s+({NAME_RE})",
-    ]
-    return any(re.search(p, query, flags=re.IGNORECASE) for p in patterns)
-
-
-def _explicit_dns_trigger(query: str) -> bool:
-    return "dns server" in query.lower() or "dns servers" in query.lower()
-
-
-def _explicit_append_tags_trigger(query: str) -> bool:
-    return re.search(r"\bappend\s+tags\s+(true|false|yes|no)\b", query, flags=re.IGNORECASE) is not None
+def _explicit_tags_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return phrase_in_query(q, "tags") or phrase_in_query(q, "tag") or phrase_in_query(q, "labels")
 
 
 def _explicit_location_trigger(query: str) -> bool:
-    # Do not use bare "in" because that causes bad false positives.
-    return re.search(
-        r"\b(?:location|region)\s+([A-Za-z0-9._/-]+)\b",
-        query,
-        flags=re.IGNORECASE,
-    ) is not None
+    q = collapse_ws(query)
+    return phrase_in_query(q, "location") or phrase_in_query(q, "region")
 
 
 @dataclass
 class GrammarState:
     active_fields: List[str]
-    triggered: List[str] = field(default_factory=list)
+    triggered: List[str] = dataclass_field(default_factory=list)
 
 
-def infer_active_fields(query: str, schema: Dict[str, Any], module_fqn: Optional[str] = None) -> GrammarState:
-    q = f" {query.lower()} "
-    info_module = _is_info_module(module_fqn)
+def project_schema(schema: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+    wanted = set(fields)
+    projected = deepcopy(schema)
+
+    for key in ("required", "optional"):
+        if key in projected:
+            projected[key] = [f for f in projected.get(key, []) if f in wanted]
+
+    for key in ("choices", "types", "descriptions", "defaults", "aliases", "elements", "dependencies"):
+        if key not in projected or not isinstance(projected[key], dict):
+            continue
+        projected[key] = {f: deepcopy(v) for f, v in projected[key].items() if f in wanted}
+
+    if "suboptions" in projected and isinstance(projected["suboptions"], dict):
+        projected["suboptions"] = {f: deepcopy(v) for f, v in projected["suboptions"].items() if f in wanted}
+
+    return projected
+
+
+def infer_active_fields(
+    query: str,
+    schema: Dict[str, Any],
+    module_fqn: Optional[str] = None,
+) -> GrammarState:
+    """
+    Conservative semantic trigger pass.
+    """
+    q = f" {collapse_ws(query)} "
+    info_module = is_info_module(module_fqn)
 
     required = list(schema.get("required", []))
     optional = list(schema.get("optional", []))
-    all_fields = required + [f for f in optional if f not in required]
+    all_fields = unique(required + [f for f in optional if f not in required])
 
     active: List[str] = []
     triggered: List[str] = []
@@ -153,77 +108,71 @@ def infer_active_fields(query: str, schema: Dict[str, Any], module_fqn: Optional
             active.append(field)
             triggered.append(f"{field}:{reason}")
 
-    # State only for delete/remove requests.
     if _has_any(q, DELETE_CUES) and "state" in all_fields:
         add("state", "delete-trigger")
 
-    # Resource group only when explicit.
-    if "resource_group" in all_fields and _explicit_resource_group_trigger(query):
-        add("resource_group", "resource-group-cue")
-
-    # Name only when explicit or clearly embedded in an info/list request.
-    if "name" in all_fields and _explicit_name_trigger(query):
-        add("name", "name-cue")
-
-    if info_module:
-        # Info modules should be conservative: only activate fields that are explicitly asked for.
-        if "virtual_network_name" in all_fields and _explicit_virtual_network_name_trigger(query):
-            add("virtual_network_name", "info-virtual-network")
-        if "subnet_name" in all_fields and _explicit_subnet_name_trigger(query):
-            add("subnet_name", "info-subnet")
-        if "dns_servers" in all_fields and _explicit_dns_trigger(query):
-            add("dns_servers", "info-dns")
-        if "append_tags" in all_fields and _explicit_append_tags_trigger(query):
-            add("append_tags", "info-append-tags")
-        if "tags" in all_fields and _has_tags_kv(query):
-            add("tags", "info-tags")
-        return GrammarState(active_fields=active, triggered=triggered)
-
-    # Non-info modules: explicit structured fields only.
-    if "append_tags" in all_fields and _explicit_append_tags_trigger(query):
-        add("append_tags", "append-tags-cue")
-
-    if "tags" in all_fields and _has_tags_kv(query):
-        add("tags", "tags-cue")
-
-    if "dns_servers" in all_fields and _explicit_dns_trigger(query):
-        add("dns_servers", "dns-cue")
-
-    if "subnet_name" in all_fields and _explicit_subnet_name_trigger(query):
-        add("subnet_name", "subnet-cue")
-
-    if "virtual_network_name" in all_fields and _explicit_virtual_network_name_trigger(query):
-        add("virtual_network_name", "virtual-network-name-cue")
-
-    if "virtual_network" in all_fields and _explicit_virtual_network_value_trigger(query):
-        add("virtual_network", "virtual-network-cue")
-
-    if "location" in all_fields and _explicit_location_trigger(query):
-        add("location", "location-cue")
-
-    # Generic fallback only for non-sensitive fields.
     for field in all_fields:
-        if field in active:
+        if field == "state":
             continue
-        if _generic_field_trigger(field, query):
-            add(field, "generic-field-cue")
+
+        t = normalize_type(schema.get("types", {}).get(field, "str"))
+        phrases = field_phrases(schema, field)
+
+        # Boolean fields: do not activate from bare action verbs like "create".
+        if t == "bool":
+            if field in {"append_tags", "backup", "force", "enabled", "disabled", "validate", "check", "public", "private"}:
+                if any(phrase_in_query(q, p) for p in phrases) and any(cue in q for cue in BOOL_CUES):
+                    add(field, "bool-cue")
+            continue
+
+        if any(phrase_in_query(q, p) for p in phrases):
+            if field in GENERIC_NAME_FIELDS:
+                if field == "name":
+                    add(field, "name-cue")
+                else:
+                    add(field, "field-cue")
+                continue
+
+            if t in {"list", "dict"}:
+                add(field, f"{t}-cue")
+                continue
+
+            add(field, "field-cue")
+            continue
+
+        if field == "append_tags" and phrase_in_query(query, "append tags"):
+            add(field, "append-tags-cue")
+            continue
+
+        if field == "tags" and _explicit_tags_trigger(query):
+            add(field, "tags-cue")
+            continue
+
+        if field == "resource_group" and _explicit_resource_group_trigger(query):
+            add(field, "resource-group-cue")
+            continue
+
+        if field == "name" and _explicit_name_trigger(query):
+            add(field, "name-cue")
+            continue
+
+        if field in {"location", "region"} and _explicit_location_trigger(query):
+            add(field, "location-cue")
+            continue
+
+        if info_module:
+            continue
+
+        if t == "list" and any(word in q for word in SPECIAL_LISTISH_WORDS):
+            if any(phrase_in_query(q, p) for p in phrases):
+                add(field, "list-cue")
+        elif t == "dict" and any(word in q for word in SPECIAL_DICTISH_WORDS):
+            if any(phrase_in_query(q, p) for p in phrases):
+                add(field, "dict-cue")
+
+    if not active:
+        active = [f for f in required if f in all_fields]
+        for f in active:
+            triggered.append(f"{f}:required-fallback")
 
     return GrammarState(active_fields=active, triggered=triggered)
-
-
-def project_schema(schema: Dict[str, Any], active_fields: List[str]) -> Dict[str, Any]:
-    active = set(active_fields)
-    out = deepcopy(schema)
-
-    out["required"] = [f for f in schema.get("required", []) if f in active]
-    out["optional"] = [f for f in schema.get("optional", []) if f in active]
-    out["choices"] = {k: v for k, v in schema.get("choices", {}).items() if k in active}
-    out["types"] = {k: v for k, v in schema.get("types", {}).items() if k in active}
-    out["descriptions"] = {k: v for k, v in schema.get("descriptions", {}).items() if k in active}
-    out["defaults"] = {k: v for k, v in schema.get("defaults", {}).items() if k in active}
-    out["aliases"] = {k: v for k, v in schema.get("aliases", {}).items() if k in active}
-    out["elements"] = {k: v for k, v in schema.get("elements", {}).items() if k in active}
-    out["dependencies"] = {k: v for k, v in schema.get("dependencies", {}).items() if k in active}
-    out["suboptions"] = {k: v for k, v in schema.get("suboptions", {}).items() if k in active}
-
-    return out
