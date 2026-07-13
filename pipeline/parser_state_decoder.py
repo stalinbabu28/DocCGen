@@ -6,11 +6,12 @@ from typing import Any, Dict, List, Optional
 
 from llama_cpp import LlamaGrammar
 
-from pipeline.decoder_time_triggers import DecoderTimeTriggerEngine
+from pipeline.backtracking import save_checkpoint, restore_checkpoint
+from pipeline.decoder_time_triggers import DecoderTimeTriggerEngine, StructuralTriggerKind
 from pipeline.llm import get_llm
 from pipeline.parser_state import FieldKind, ParserMode, ParserState
 from pipeline.trigger_rules import infer_active_fields, project_schema
-from pipeline.value_hints import infer_value_hints
+from pipeline.value_hints import infer_value_hints, placeholder_for_field
 from pipeline.yaml_grammar_builder import build_yaml_grammar
 
 
@@ -27,22 +28,10 @@ class TemplatePiece:
 
 class Phase3ParserStateDecoder:
     """
-    Phase 3: decoder-time trigger engine.
-
-    This decoder keeps Phase 2's parser-state mutation, but structural triggers
-    now fire on emitted YAML structure:
-    - header emission
-    - entering list bodies
-    - emitting list items
-    - entering dict bodies
-    - emitting dict pairs
-    - indentation mismatch detection
-
-    Phase 4 will add recovery/backtracking for invalid indentation.
+    Phase 3 decoder with structural triggers and Phase 4 backtracking support.
     """
 
     def __init__(self):
-        # Lazy-load the model only if a piece actually needs it.
         self._llm = None
         self.trigger_engine = DecoderTimeTriggerEngine()
 
@@ -64,13 +53,13 @@ class Phase3ParserStateDecoder:
         return f'root ::= {json.dumps(text)}'
 
     def _ordered_fields(self, schema: Dict[str, Any], active_fields: List[str]) -> List[str]:
-        required = [f for f in schema.get("required", []) if f in active_fields]
-        optional = [f for f in schema.get("optional", []) if f in active_fields]
-
+        required = list(schema.get("required", []))
         ordered: List[str] = []
-        for field in required + optional + active_fields:
+
+        for field in required + active_fields:
             if field not in ordered:
                 ordered.append(field)
+
         return ordered
 
     def _field_kind(self, schema: Dict[str, Any], field: str, hint: Any) -> FieldKind:
@@ -116,12 +105,12 @@ class Phase3ParserStateDecoder:
             terminal_for_field=False,
         )
 
-    def _scalar_piece(self, state: ParserState) -> TemplatePiece:
+    def _scalar_piece(self, state: ParserState, loosen: bool = False) -> TemplatePiece:
         assert state.current is not None
         field = state.current.name
         hint = state.current.hint
 
-        if hint is not None:
+        if hint is not None and not loosen:
             text = f"    {field}: {self._yaml_atom(hint)}\n"
             return TemplatePiece(
                 label=f"{field}:scalar-direct",
@@ -132,7 +121,13 @@ class Phase3ParserStateDecoder:
                 field=field,
             )
 
-        grammar = self._single_field_grammar(state.schema, state.module_fqn, field, hint)
+        grammar_hint = None if loosen else hint
+        grammar = self._single_field_grammar(
+            state.schema,
+            state.module_fqn,
+            field,
+            grammar_hint,
+        )
         return TemplatePiece(
             label=f"{field}:scalar-grammar",
             grammar_text=grammar,
@@ -141,13 +136,13 @@ class Phase3ParserStateDecoder:
             field=field,
         )
 
-    def _list_piece(self, state: ParserState) -> TemplatePiece:
+    def _list_piece(self, state: ParserState, loosen: bool = False) -> TemplatePiece:
         assert state.current is not None
         field = state.current.name
         ctx = state.current
 
-        if not ctx.started:
-            if isinstance(ctx.hint, list) and ctx.hint:
+        if not loosen:
+            if not ctx.started and isinstance(ctx.hint, list) and ctx.hint:
                 text = f"    {field}:\n"
                 return TemplatePiece(
                     label=f"{field}:list-header",
@@ -159,29 +154,25 @@ class Phase3ParserStateDecoder:
                     terminal_for_field=False,
                 )
 
-            grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
-            return TemplatePiece(
-                label=f"{field}:list-block",
-                grammar_text=grammar,
-                max_tokens=64,
-                kind="list-block",
-                field=field,
-            )
+            if ctx.started and isinstance(ctx.hint, list) and ctx.item_index < len(ctx.hint):
+                item = ctx.hint[ctx.item_index]
+                text = f"        - {self._yaml_atom(item)}\n"
+                return TemplatePiece(
+                    label=f"{field}:item-{ctx.item_index + 1}",
+                    grammar_text=self._exact_grammar(text),
+                    max_tokens=16,
+                    kind="list-item",
+                    direct_text=text,
+                    field=field,
+                    terminal_for_field=(ctx.item_index == len(ctx.hint) - 1),
+                )
 
-        if isinstance(ctx.hint, list) and ctx.item_index < len(ctx.hint):
-            item = ctx.hint[ctx.item_index]
-            text = f"        - {self._yaml_atom(item)}\n"
-            return TemplatePiece(
-                label=f"{field}:item-{ctx.item_index + 1}",
-                grammar_text=self._exact_grammar(text),
-                max_tokens=16,
-                kind="list-item",
-                direct_text=text,
-                field=field,
-                terminal_for_field=(ctx.item_index == len(ctx.hint) - 1),
-            )
-
-        grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
+        grammar = self._single_field_grammar(
+            state.schema,
+            state.module_fqn,
+            field,
+            None if loosen else ctx.hint,
+        )
         return TemplatePiece(
             label=f"{field}:list-block",
             grammar_text=grammar,
@@ -190,13 +181,13 @@ class Phase3ParserStateDecoder:
             field=field,
         )
 
-    def _dict_piece(self, state: ParserState) -> TemplatePiece:
+    def _dict_piece(self, state: ParserState, loosen: bool = False) -> TemplatePiece:
         assert state.current is not None
         field = state.current.name
         ctx = state.current
 
-        if not ctx.started:
-            if isinstance(ctx.hint, dict) and ctx.hint:
+        if not loosen:
+            if not ctx.started and isinstance(ctx.hint, dict) and ctx.hint:
                 text = f"    {field}:\n"
                 return TemplatePiece(
                     label=f"{field}:dict-header",
@@ -208,29 +199,25 @@ class Phase3ParserStateDecoder:
                     terminal_for_field=False,
                 )
 
-            grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
-            return TemplatePiece(
-                label=f"{field}:dict-block",
-                grammar_text=grammar,
-                max_tokens=64,
-                kind="dict-block",
-                field=field,
-            )
+            if ctx.started and isinstance(ctx.hint, dict) and ctx.pair_index < len(ctx.hint):
+                key, value = list(ctx.hint.items())[ctx.pair_index]
+                text = f"        {key}: {self._yaml_atom(value)}\n"
+                return TemplatePiece(
+                    label=f"{field}:pair-{ctx.pair_index + 1}",
+                    grammar_text=self._exact_grammar(text),
+                    max_tokens=16,
+                    kind="dict-pair",
+                    direct_text=text,
+                    field=field,
+                    terminal_for_field=(ctx.pair_index == len(ctx.hint) - 1),
+                )
 
-        if isinstance(ctx.hint, dict) and ctx.pair_index < len(ctx.hint):
-            key, value = list(ctx.hint.items())[ctx.pair_index]
-            text = f"        {key}: {self._yaml_atom(value)}\n"
-            return TemplatePiece(
-                label=f"{field}:pair-{ctx.pair_index + 1}",
-                grammar_text=self._exact_grammar(text),
-                max_tokens=16,
-                kind="dict-pair",
-                direct_text=text,
-                field=field,
-                terminal_for_field=(ctx.pair_index == len(ctx.hint) - 1),
-            )
-
-        grammar = self._single_field_grammar(state.schema, state.module_fqn, field, ctx.hint)
+        grammar = self._single_field_grammar(
+            state.schema,
+            state.module_fqn,
+            field,
+            None if loosen else ctx.hint,
+        )
         return TemplatePiece(
             label=f"{field}:dict-block",
             grammar_text=grammar,
@@ -239,30 +226,30 @@ class Phase3ParserStateDecoder:
             field=field,
         )
 
-    def _piece_for_state(self, state: ParserState) -> TemplatePiece:
+    def _piece_for_state(self, state: ParserState, loosened_fields: set[str]) -> TemplatePiece:
         if state.mode == ParserMode.HEADER:
             return self._header_piece(state.module_fqn)
 
         if state.current is None:
-            return self._header_piece(state.module_fqn)
+            raise RuntimeError("Parser state has no current field while not in HEADER mode.")
+
+        loosen = state.current.name in loosened_fields
 
         if state.current.kind == FieldKind.SCALAR:
-            return self._scalar_piece(state)
+            return self._scalar_piece(state, loosen=loosen)
 
         if state.current.kind == FieldKind.LIST:
-            return self._list_piece(state)
+            return self._list_piece(state, loosen=loosen)
 
         if state.current.kind == FieldKind.DICT:
-            return self._dict_piece(state)
+            return self._dict_piece(state, loosen=loosen)
 
-        return self._scalar_piece(state)
+        return self._scalar_piece(state, loosen=loosen)
 
     def _emit_piece(self, query: str, output: str, piece: TemplatePiece) -> str:
-        # Deterministic path: no model needed.
         if piece.direct_text is not None:
             return piece.direct_text
 
-        # Only load the model when grammar-constrained decoding is truly required.
         llm = self._get_llm()
 
         prompt = f"""
@@ -304,11 +291,34 @@ YAML:
         max_tokens: int = 256,
         debug: bool = False,
         return_metadata: bool = False,
+        enable_backtracking: bool = True,
+        max_backtracks: int = 12,
     ):
         trigger_state = infer_active_fields(query, schema, module_fqn=module_fqn)
-        active_fields = trigger_state.active_fields or list(schema.get("required", []))
-        value_hints = infer_value_hints(query, schema, module_fqn=module_fqn)
+        inferred_fields = list(trigger_state.active_fields or [])
+
+        real_value_hints = infer_value_hints(
+            query,
+            schema,
+            module_fqn=module_fqn,
+            include_placeholders=False,
+        )
+
+        required_fields = list(schema.get("required", []))
+
+        active_fields: List[str] = []
+        for field in required_fields + inferred_fields + list(real_value_hints.keys()):
+            if field not in active_fields:
+                active_fields.append(field)
+
         ordered_fields = self._ordered_fields(schema, active_fields)
+
+        value_hints = real_value_hints.copy()
+        for field in active_fields:
+            if field not in value_hints:
+                ph = placeholder_for_field(field)
+                if ph is not None:
+                    value_hints[field] = ph
 
         state = ParserState(
             query=query,
@@ -338,6 +348,10 @@ YAML:
             print("CURRENT TEMPLATE:", state.current_template())
 
         budget_left = max_tokens
+        piece_index = 0
+        backtracks_used = 0
+        loosened_fields: set[str] = set()
+        piece_attempts: dict[str, int] = {}
 
         while budget_left > 0 and not state.done():
             if state.current is None:
@@ -351,7 +365,18 @@ YAML:
                 kind = self._field_kind(state.schema, field_name, hint)
                 state.select_current_field(kind=kind, hint=hint, suboptions=suboptions)
 
-            piece = self._piece_for_state(state)
+            piece = self._piece_for_state(state, loosened_fields=loosened_fields)
+            checkpoint = save_checkpoint(
+                state=state,
+                budget_left=budget_left,
+                piece_index=piece_index,
+                loosened_fields=loosened_fields,
+                backtracks_used=backtracks_used,
+                metadata={
+                    "piece_label": piece.label,
+                    "field": piece.field,
+                },
+            )
 
             if debug:
                 print("=" * 100)
@@ -363,34 +388,88 @@ YAML:
                 print("OUTPUT SO FAR:")
                 print(state.output)
 
-            generated = self._emit_piece(query, state.output, piece)
-            state.output += generated
-            state.mark_emitted(piece.label)
-            budget_left -= piece.max_tokens
+            try:
+                generated = self._emit_piece(query, state.output, piece)
 
-            events = self.trigger_engine.apply(
-                state=state,
-                piece_kind=piece.kind,
-                piece_label=piece.label,
-                generated=generated,
-                debug=debug,
-            )
+                if generated is None:
+                    generated = ""
 
-            if debug:
-                print("GENERATED PIECE:")
-                print(repr(generated))
-                print("TRIGGER EVENTS:")
-                print([e.kind.name for e in events])
-                print("FULL OUTPUT:")
-                print(state.output)
-                print("PARSER LOG:")
-                print(state.parser_log)
-                print("DECODER LOG:")
-                print(state.decoder_log)
-                print("TRIGGER LOG:")
-                print(state.trigger_log)
-                print("TEMPLATE STACK:")
-                print(state.template_stack)
+                if not generated.strip():
+                    raise RuntimeError(f"Empty generation for piece {piece.label}")
+
+                state.output += generated
+                state.mark_emitted(piece.label)
+                budget_left -= piece.max_tokens
+
+                events = self.trigger_engine.apply(
+                    state=state,
+                    piece_kind=piece.kind,
+                    piece_label=piece.label,
+                    generated=generated,
+                    debug=debug,
+                )
+
+                if any(e.kind == StructuralTriggerKind.INVALID_INDENTATION for e in events):
+                    raise RuntimeError(
+                        f"invalid indentation for {piece.label}: "
+                        f"{[e.reason for e in events if e.kind == StructuralTriggerKind.INVALID_INDENTATION]}"
+                    )
+
+                if piece.terminal_for_field:
+                    state.finish_current_field()
+
+                if debug:
+                    print("GENERATED PIECE:")
+                    print(repr(generated))
+                    print("TRIGGER EVENTS:")
+                    print([e.kind.name for e in events])
+                    print("FULL OUTPUT:")
+                    print(state.output)
+                    print("PARSER LOG:")
+                    print(state.parser_log)
+                    print("DECODER LOG:")
+                    print(state.decoder_log)
+                    print("TRIGGER LOG:")
+                    print(state.trigger_log)
+                    print("TEMPLATE STACK:")
+                    print(state.template_stack)
+
+                piece_index += 1
+
+            except Exception as exc:
+                if debug:
+                    print(f"BACKTRACK CANDIDATE: {piece.label} -> {type(exc).__name__}: {exc}")
+
+                if not enable_backtracking:
+                    raise
+
+                if backtracks_used >= max_backtracks:
+                    state.record_decoder_event(f"backtrack:budget_exhausted:{piece.label}")
+                    break
+
+                restored = restore_checkpoint(checkpoint)
+                state = restored[0]
+                budget_left = restored[1]
+                piece_index = restored[2]
+                loosened_fields = restored[3]
+                backtracks_used = restored[4]
+                metadata = restored[5]
+
+                field_key = metadata.get("field") or metadata.get("piece_label") or piece.label
+                loosened_fields.add(field_key)
+                piece_attempts[field_key] = piece_attempts.get(field_key, 0) + 1
+                backtracks_used += 1
+
+                state.record_decoder_event(
+                    f"backtrack:{field_key}:{backtracks_used}:{type(exc).__name__}"
+                )
+
+                if debug:
+                    print(f"RESTORED CHECKPOINT FOR: {field_key}")
+                    print("LOOSENED FIELDS:", sorted(loosened_fields))
+                    print("BACKTRACKS USED:", backtracks_used)
+
+                continue
 
         result = state.output.rstrip()
 
@@ -408,6 +487,9 @@ YAML:
                 "current_indent": state.current_indent,
                 "switch_count": len([x for x in state.trigger_log if x.startswith("fire:")]),
                 "output": result,
+                "backtracks_used": backtracks_used,
+                "loosened_fields": sorted(loosened_fields),
+                "piece_attempts": piece_attempts,
             }
 
         return result
@@ -423,6 +505,8 @@ def generate_parser_state_yaml(
     max_tokens: int = 256,
     debug: bool = False,
     return_metadata: bool = False,
+    enable_backtracking: bool = True,
+    max_backtracks: int = 12,
 ):
     decoder = Phase3ParserStateDecoder()
     return decoder.decode(
@@ -432,4 +516,6 @@ def generate_parser_state_yaml(
         max_tokens=max_tokens,
         debug=debug,
         return_metadata=return_metadata,
+        enable_backtracking=enable_backtracking,
+        max_backtracks=max_backtracks,
     )

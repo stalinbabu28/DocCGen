@@ -84,7 +84,11 @@ def _extract_bool(query: str, phrases: List[str]) -> Optional[bool]:
     for phrase in phrases:
         tail = extract_after_phrase_segment(query, [phrase])
         if tail:
-            m = re.search(r"\b(true|false|yes|no|1|0|on|off|enabled|disabled)\b", tail, flags=re.IGNORECASE)
+            m = re.search(
+                r"\b(true|false|yes|no|1|0|on|off|enabled|disabled)\b",
+                tail,
+                flags=re.IGNORECASE,
+            )
             if m:
                 return normalize_bool(m.group(1)) == "true"
 
@@ -95,12 +99,6 @@ def _extract_bool(query: str, phrases: List[str]) -> Optional[bool]:
     return None
 
 
-# A plain \b boundary treats "-" (and ".", "/") as non-word characters, so
-# `\bsrc\b` will happily match the "src" inside "demo-src" — then the pattern
-# goes on to capture whatever word follows ("into", etc.) as the field value.
-# PHRASE_BOUNDARY excludes those characters too, so a phrase only matches when
-# it's a standalone token in the query, not a substring of a hyphenated /
-# dotted placeholder value.
 PHRASE_BOUNDARY_PRE = r"(?<![A-Za-z0-9_.-])"
 PHRASE_BOUNDARY_POST = r"(?![A-Za-z0-9_.-])"
 
@@ -122,7 +120,7 @@ def _extract_int(query: str, phrases: List[str]) -> Optional[int]:
         return int(m)
     return None
 
-
+    
 def _extract_scalar(query: str, phrases: List[str]) -> Optional[str]:
     patterns: List[str] = []
     for phrase in phrases:
@@ -182,7 +180,7 @@ def _extract_dict(query: str, phrases: List[str]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _placeholder_for_field(field: str) -> Optional[Any]:
+def placeholder_for_field(field: str) -> Optional[Any]:
     if field in DEFAULT_PLACEHOLDERS:
         return DEFAULT_PLACEHOLDERS[field]
 
@@ -218,13 +216,75 @@ def _placeholder_for_field(field: str) -> Optional[Any]:
     return None
 
 
+def _extract_directional_field_value(field: str, query: str) -> Optional[Any]:
+    q = collapse_ws(query)
+    lower = field.lower()
+
+    patterns: List[str] = []
+
+    if lower in {"src", "source"}:
+        patterns.extend([
+            rf"\bfrom\s+({NAME_RE})",
+            rf"\bsource(?:\s+is|:|=)?\s+({NAME_RE})",
+            rf"\busing\s+({NAME_RE})",
+        ])
+
+    elif lower in {"dest", "destination", "target", "output", "to", "into"}:
+        patterns.extend([
+            rf"\bto\s+({NAME_RE})",
+            rf"\binto\s+({NAME_RE})",
+            rf"\bdest(?:ination)?(?:\s+is|:|=)?\s+({NAME_RE})",
+            rf"\btarget(?:\s+is|:|=)?\s+({NAME_RE})",
+        ])
+
+    elif lower == "name" or lower.endswith("_name"):
+        patterns.extend([
+            rf"\b(?:called|named)\s+({NAME_RE})",
+            rf"\bname(?:\s+is|:|=)?\s+({NAME_RE})",
+        ])
+
+    elif "group" in lower:
+        patterns.extend([
+            rf"\bresource\s+group(?:\s+is|:|=)?\s+({NAME_RE})",
+            rf"\bgroup(?:\s+is|:|=)?\s+({NAME_RE})",
+        ])
+
+    elif "path" in lower:
+        patterns.extend([
+            rf"\bpath(?:\s+is|:|=)?\s+({NAME_RE})",
+            rf"\bfile(?:\s+is|:|=)?\s+({NAME_RE})",
+        ])
+
+    elif "url" in lower:
+        patterns.extend([
+            rf"\burl(?:\s+is|:|=)?\s+({NAME_RE})",
+            rf"\bdownload\s+({NAME_RE})",
+        ])
+
+    if patterns:
+        m = first_match(query, patterns)
+        if m:
+            m = clean_scalar(m)
+            if not _looks_bad_scalar(m):
+                return m
+
+    return None
+
+
 def infer_value_hints(
     query: str,
     schema: Dict[str, Any],
     module_fqn: Optional[str] = None,
+    *,
+    include_placeholders: bool = True,
 ) -> Dict[str, Any]:
     """
     Schema-driven value extraction with punctuation cleanup.
+
+    When include_placeholders=False, only values explicitly extracted from the
+    query are returned. This is useful for deciding which fields should become
+    active. When include_placeholders=True, fallback demo placeholders are also
+    returned for active/required fields.
     """
     hints: Dict[str, Any] = {}
     q = query.strip()
@@ -233,9 +293,11 @@ def infer_value_hints(
     choices = schema.get("choices", {}) or {}
 
     if "state" in types:
-        if " delete " in ql or " remove " in ql:
+        # Only activate state when the query explicitly talks about state,
+        # or when it is clearly a delete/remove/absent request.
+        if " delete " in ql or " remove " in ql or " absent " in ql:
             hints["state"] = "absent"
-        elif " present " in ql or " ensure " in ql or " create " in ql or " update " in ql:
+        elif phrase_in_query(ql, "state"):
             hints["state"] = "present"
 
     for field, raw_type in types.items():
@@ -275,13 +337,19 @@ def infer_value_hints(
                 hints[field] = v
                 continue
 
+        v = _extract_directional_field_value(field, q)
+        if v is not None:
+            hints[field] = v
+            continue
+
         v = _extract_scalar(q, phrases)
         if v is not None:
             hints[field] = v
             continue
 
-        placeholder = _placeholder_for_field(field)
-        if placeholder is not None:
-            hints[field] = placeholder
+        if include_placeholders:
+            placeholder = placeholder_for_field(field)
+            if placeholder is not None:
+                hints[field] = placeholder
 
     return hints

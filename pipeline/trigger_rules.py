@@ -84,6 +84,21 @@ def project_schema(schema: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
 
     return projected
 
+def _explicit_src_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return phrase_in_query(q, "from") or phrase_in_query(q, "source") or phrase_in_query(q, "using")
+
+
+def _explicit_dest_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return (
+        phrase_in_query(q, "to")
+        or phrase_in_query(q, "into")
+        or phrase_in_query(q, "dest")
+        or phrase_in_query(q, "destination")
+        or phrase_in_query(q, "target")
+    )
+
 
 def infer_active_fields(
     query: str,
@@ -117,6 +132,14 @@ def infer_active_fields(
 
         t = normalize_type(schema.get("types", {}).get(field, "str"))
         phrases = field_phrases(schema, field)
+
+        if field in {"src", "source"} and _explicit_src_trigger(query):
+            add(field, "src-directional-cue")
+            continue
+
+        if field in {"dest", "destination", "target"} and _explicit_dest_trigger(query):
+            add(field, "dest-directional-cue")
+            continue
 
         # Boolean fields: do not activate from bare action verbs like "create".
         if t == "bool":

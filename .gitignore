@@ -30,6 +30,9 @@ evaluation/hybrid_colbert100/
 evaluation/hybrid_colbert5
 evaluation/phase3_corpus_full/
 evaluation/phase3_corpus_sample/
+evaluation/phase4_backtracking5
+evaluation/phase4_backtracking10
+evaluation/phase4_backtracking100
 evaluation/retrieval_test/
 
 experiments/
