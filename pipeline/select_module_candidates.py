@@ -15,6 +15,10 @@ COLBERT_INDEX_ROOT = Path(
 COLBERT_EXPERIMENT = os.getenv("COLBERT_EXPERIMENT", "phase3_colbert")
 COLBERT_ZERO_INDEX_NAME = os.getenv("COLBERT_ZERO_INDEX_NAME", "phase3_colbert_zero")
 COLBERT_FT_INDEX_NAME = os.getenv("COLBERT_FT_INDEX_NAME", "phase3_colbert_ft")
+BM25_DOC_MAP = Path(
+    os.getenv("BM25_DOC_MAP", str(PROJECT_ROOT / "colbert_data" / "data" / "doc_map.json"))
+).resolve()
+
 RETRIEVER_MODE = os.getenv("RETRIEVER_MODE", "colbert_zero").strip().lower()
 
 INFO_CUES = (
@@ -67,8 +71,6 @@ def _load_doc_map() -> List[dict]:
 
 @lru_cache(maxsize=1)
 def _docs_by_pid() -> List[dict]:
-    # ColBERT pids are 0-based collection positions.
-    # Our collection.tsv was written in ascending old-pid order.
     return sorted(_load_doc_map(), key=lambda d: int(d["pid"]))
 
 
@@ -268,11 +270,6 @@ def _normalize_raw_candidate(raw: Any) -> Optional[dict]:
 
 @lru_cache(maxsize=1)
 def _load_hybrid_backend() -> Callable[[str, int], List[Any]]:
-    """
-    Tries to use the existing hybrid retriever module if present.
-    The code supports several common entrypoints so it is resilient
-    to small API differences.
-    """
     module = import_module("retrieval.hybrid_retriever")
 
     candidate_names = [
@@ -328,6 +325,13 @@ def _load_hybrid_backend() -> Callable[[str, int], List[Any]]:
     )
 
 
+@lru_cache(maxsize=1)
+def _load_bm25_backend():
+    from retrieval.bm25_retriever import BM25Retriever
+
+    return BM25Retriever(doc_map_path=BM25_DOC_MAP)
+
+
 @lru_cache(maxsize=2)
 def _load_colbert_searcher(index_name: str):
     from colbert import Searcher
@@ -345,17 +349,36 @@ def _load_colbert_searcher(index_name: str):
     return searcher
 
 
+@lru_cache(maxsize=2)
+def _load_bm25_colbert_backend(index_name: str):
+    from retrieval.bm25_colbert_retriever import BM25ColBERTRetriever
+
+    return BM25ColBERTRetriever(
+        project_root=PROJECT_ROOT,
+        experiment=COLBERT_EXPERIMENT,
+        index_name=index_name,
+        doc_map_path=BM25_DOC_MAP,
+    )
+
+def _load_hybrid_colbert_backend(index_name: str):
+    from retrieval.hybrid_colbert_retriever import HybridColBERTRetriever
+
+    return HybridColBERTRetriever(
+        project_root=PROJECT_ROOT,
+        experiment=COLBERT_EXPERIMENT,
+        index_name=index_name,
+    )
+
+
 def _retrieve_hybrid(query: str, k: int) -> List[dict]:
     backend = _load_hybrid_backend()
     raw = backend(query, k)
 
     if isinstance(raw, tuple):
-        # Common patterns: (scores, paths) or (paths, scores)
-        if len(raw) == 2 and len(raw[1]) if hasattr(raw[1], "__len__") else False:
+        if len(raw) == 2 and hasattr(raw[1], "__len__"):
             out: List[dict] = []
             a, b = raw
             if len(a) == len(b):
-                # treat as (items, scores) if items look like strings/dicts
                 if len(a) > 0 and isinstance(a[0], (str, dict, tuple, list)):
                     items, scores = a, b
                 else:
@@ -378,6 +401,12 @@ def _retrieve_hybrid(query: str, k: int) -> List[dict]:
 
     cand = _normalize_raw_candidate(raw)
     return [cand] if cand is not None else []
+
+
+def _retrieve_bm25(query: str, k: int) -> List[dict]:
+    backend = _load_bm25_backend()
+    raw = backend.retrieve(query, top_k=k)
+    return [cand for cand in (_normalize_raw_candidate(x) for x in raw) if cand is not None]
 
 
 def _retrieve_colbert(query: str, k: int, index_name: str) -> List[dict]:
@@ -408,12 +437,37 @@ def _retrieve_colbert(query: str, k: int, index_name: str) -> List[dict]:
     return out
 
 
+def _retrieve_bm25_colbert(query: str, k: int, index_name: str) -> List[dict]:
+    backend = _load_bm25_colbert_backend(index_name)
+    raw = backend.retrieve(query, top_k=k)
+    return [cand for cand in (_normalize_raw_candidate(x) for x in raw) if cand is not None]
+
+def _retrieve_hybrid_colbert(query: str, k: int, index_name: str) -> List[dict]:
+    backend = _load_hybrid_colbert_backend(index_name)
+    raw = backend.retrieve(query, top_k=k)
+
+    return [
+        cand
+        for cand in (_normalize_raw_candidate(x) for x in raw)
+        if cand is not None
+    ]
+
 def _selected_mode() -> str:
     mode = RETRIEVER_MODE
     if mode in {"colbert", "zero", "zero_shot", "zero-shot"}:
         return "colbert_zero"
     if mode in {"ft", "fine_tuned", "fine-tuned"}:
         return "colbert_ft"
+    if mode in {"bm25+colbert", "bm25-colbert", "bm25_colbert_fusion"}:
+        return "bm25_colbert"
+    if mode in {"bm25-only", "bm25_sparse", "bm25s"}:
+        return "bm25"
+    if mode in {
+        "hybrid+colbert",
+        "hybrid-colbert",
+        "hybrid_colbert",
+    }:
+        return "hybrid_colbert"
     return mode
 
 
@@ -422,14 +476,24 @@ def _raw_candidates(query: str, k: int) -> List[dict]:
 
     if mode == "hybrid":
         raw_candidates = _retrieve_hybrid(query, k)
+    elif mode == "bm25":
+        raw_candidates = _retrieve_bm25(query, k)
     elif mode == "colbert_zero":
         raw_candidates = _retrieve_colbert(query, k, COLBERT_ZERO_INDEX_NAME)
     elif mode == "colbert_ft":
         raw_candidates = _retrieve_colbert(query, k, COLBERT_FT_INDEX_NAME)
+    elif mode == "bm25_colbert":
+        raw_candidates = _retrieve_bm25_colbert(query, k, COLBERT_ZERO_INDEX_NAME)
+    elif mode == "hybrid_colbert":
+        raw_candidates = _retrieve_hybrid_colbert(
+            query,
+            k,
+            COLBERT_FT_INDEX_NAME,
+        )
     else:
         raise ValueError(
             f"Unknown RETRIEVER_MODE={RETRIEVER_MODE!r}. "
-            f"Use hybrid, colbert_zero, colbert, or colbert_ft."
+            f"Use hybrid, bm25, bm25_colbert, hybrid_colbert, colbert_zero, colbert, or colbert_ft."
         )
 
     normalized: List[dict] = []
@@ -449,11 +513,13 @@ def get_ranked_candidates(
     """
     Returns ranked candidates using one of:
       - hybrid
+      - bm25
+      - bm25_colbert
       - colbert_zero / colbert
       - colbert_ft
 
     Controlled by:
-      RETRIEVER_MODE=hybrid | colbert_zero | colbert | colbert_ft
+      RETRIEVER_MODE=hybrid | bm25 | bm25_colbert | colbert_zero | colbert | colbert_ft
     """
     candidates = _raw_candidates(query, k)
 

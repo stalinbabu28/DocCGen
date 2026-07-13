@@ -29,8 +29,11 @@ def _selected_retriever_mode() -> str:
         return "colbert_zero"
     if mode in {"ft", "fine_tuned", "fine-tuned", "colbert_ft"}:
         return "colbert_ft"
+    if mode in {"bm25", "bm25_only", "bm25-sparse"}:
+        return "bm25"
+    if mode in {"bm25_colbert", "bm25+colbert", "bm25-colbert"}:
+        return "bm25_colbert"
     return mode
-
 # Cap how much a single repeated token can contribute to the sparse score.
 # Without this, a long, verbose module description that happens to repeat a
 # common query word many times (e.g. "from", "to", "template") can outscore a
@@ -166,6 +169,96 @@ class PipelineColBERTSelector(DocumentSelector):
         return {
             "path": top["source"],
             "module_fqn": top["module"],
+            "candidates": candidates,
+        }
+
+class PipelineBM25Selector(DocumentSelector):
+    def __init__(self, project_root, docs_dir):
+        from retrieval.bm25_retriever import BM25Retriever
+
+        self.retriever = BM25Retriever(
+            docs_dir=docs_dir,
+            doc_map_path=Path(project_root)
+            / "colbert_data"
+            / "data"
+            / "doc_map.json",
+        )
+
+    def retrieve(self, query):
+        results = self.retriever.retrieve(query, top_k=10)
+
+        if not results:
+            return {
+                "path": None,
+                "module_fqn": "",
+                "candidates": [],
+            }
+
+        candidates = [r["source"] for r in results]
+        top = results[0]
+
+        return {
+            "path": top["source"],
+            "module_fqn": top["module_fqn"],
+            "candidates": candidates,
+        }
+
+
+class PipelineBM25ColBERTSelector(DocumentSelector):
+    def __init__(self, project_root, experiment="phase3_colbert", index_name="phase3_colbert_zero"):
+        from retrieval.bm25_colbert_retriever import BM25ColBERTRetriever
+
+        self.retriever = BM25ColBERTRetriever(
+            project_root=project_root,
+            experiment=experiment,
+            index_name=index_name,
+        )
+
+    def retrieve(self, query):
+        results = self.retriever.retrieve(query, top_k=10)
+
+        if not results:
+            return {
+                "path": None,
+                "module_fqn": "",
+                "candidates": [],
+            }
+
+        candidates = [r["source"] for r in results]
+        top = results[0]
+
+        return {
+            "path": top["source"],
+            "module_fqn": top["module_fqn"],
+            "candidates": candidates,
+        }
+
+class PipelineHybridColBERTSelector(DocumentSelector):
+    def __init__(self, project_root):
+        from retrieval.hybrid_colbert_retriever import HybridColBERTRetriever
+
+        self.retriever = HybridColBERTRetriever(
+            project_root=project_root,
+            experiment="phase3_colbert",
+            index_name="phase3_colbert_ft",
+        )
+
+    def retrieve(self, query):
+        results = self.retriever.retrieve(query, top_k=10)
+
+        if not results:
+            return {
+                "path": None,
+                "module_fqn": "",
+                "candidates": [],
+            }
+
+        candidates = [r["source"] for r in results]
+        top = results[0]
+
+        return {
+            "path": top["source"],
+            "module_fqn": top["module_fqn"],
             "candidates": candidates,
         }
 
@@ -662,6 +755,22 @@ def build_selector(project_root: Path, docs_dir: str, embeddings_file: str):
             embeddings_file=embeddings_file,
         )
 
+    if mode == "bm25":
+        print("RETRIEVER_MODE: bm25 -> PipelineBM25Selector")
+        return PipelineBM25Selector(
+            project_root=project_root,
+            docs_dir=docs_dir,
+        )
+
+    if mode == "bm25_colbert":
+        colbert_fusion_index = os.getenv("COLBERT_FUSION_INDEX_NAME", "phase3_colbert_zero")
+        print(f"RETRIEVER_MODE: bm25_colbert -> PipelineBM25ColBERTSelector ({colbert_fusion_index})")
+        return PipelineBM25ColBERTSelector(
+            project_root=project_root,
+            experiment="phase3_colbert",
+            index_name=colbert_fusion_index,
+        )
+
     if mode == "colbert_zero":
         print("RETRIEVER_MODE: colbert_zero -> PipelineColBERTSelector (phase3_colbert_zero)")
         return PipelineColBERTSelector(
@@ -677,12 +786,16 @@ def build_selector(project_root: Path, docs_dir: str, embeddings_file: str):
             experiment="phase3_colbert",
             index_name="phase3_colbert_ft",
         )
+    if mode == "hybrid_colbert":
+        print("RETRIEVER_MODE: hybrid_colbert -> PipelineHybridColBERTSelector (phase3_colbert_ft)")
+        return PipelineHybridColBERTSelector(
+            project_root=project_root,
+        )
 
     raise ValueError(
         f"Unknown RETRIEVER_MODE={RETRIEVER_MODE!r}. "
-        "Use hybrid, colbert_zero, colbert, or colbert_ft."
+        "Use hybrid, bm25, bm25_colbert, hybrid_colbert, colbert_zero, colbert, or colbert_ft."
     )
-
 
 # ==============================================================================
 # MAIN HARNESS

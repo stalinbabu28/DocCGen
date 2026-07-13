@@ -24,6 +24,10 @@ evaluation/benchmark_test100_colbert/
 evaluation/colbert_ft100/
 evaluation/colbert_zero100/
 evaluation/hybrid100/
+evaluation/bm25100/
+evaluation/bm25_colbert100/
+evaluation/hybrid_colbert100/
+evaluation/hybrid_colbert5
 evaluation/phase3_corpus_full/
 evaluation/phase3_corpus_sample/
 evaluation/retrieval_test/
@@ -33,6 +37,7 @@ experiments/
 hfdoccgen_environment.yml
 
 phase3withcolbert_backup.tar.gz
+phase3withcolbert.tar.gz
 
 *.log
 
