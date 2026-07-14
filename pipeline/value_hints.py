@@ -31,7 +31,6 @@ DEFAULT_PLACEHOLDERS = {
     "src": "demo-src",
     "dest": "demo-dest",
     "url": "demo-url",
-    "line": "demo-line",
     "bucket": "demo-bucket",
     "resource_group": "prod-rg",
     "region": "us-east-1",
@@ -120,7 +119,7 @@ def _extract_int(query: str, phrases: List[str]) -> Optional[int]:
         return int(m)
     return None
 
-    
+
 def _extract_scalar(query: str, phrases: List[str]) -> Optional[str]:
     patterns: List[str] = []
     for phrase in phrases:
@@ -197,8 +196,6 @@ def placeholder_for_field(field: str) -> Optional[Any]:
         return "demo-dest"
     if "url" in lower:
         return "demo-url"
-    if "line" in lower:
-        return "demo-line"
     if "name" in lower:
         return "demo-resource"
     if "group" in lower:
@@ -222,14 +219,14 @@ def _extract_directional_field_value(field: str, query: str) -> Optional[Any]:
 
     patterns: List[str] = []
 
-    if lower in {"src", "source"}:
+    if lower in {"src", "source"} or lower.endswith("_src"):
         patterns.extend([
             rf"\bfrom\s+({NAME_RE})",
             rf"\bsource(?:\s+is|:|=)?\s+({NAME_RE})",
             rf"\busing\s+({NAME_RE})",
         ])
 
-    elif lower in {"dest", "destination", "target", "output", "to", "into"}:
+    elif lower in {"dest", "destination", "target", "output", "to", "into"} or lower.endswith("_dest"):
         patterns.extend([
             rf"\bto\s+({NAME_RE})",
             rf"\binto\s+({NAME_RE})",
@@ -261,6 +258,11 @@ def _extract_directional_field_value(field: str, query: str) -> Optional[Any]:
             rf"\bdownload\s+({NAME_RE})",
         ])
 
+    if "line" in lower:
+        m = first_match(q, [rf"\bline(?:\s+is|:|=)?\s+([0-9]+)"])
+        if m and re.fullmatch(r"[0-9]+", m):
+            return int(m)
+
     if patterns:
         m = first_match(query, patterns)
         if m:
@@ -282,9 +284,8 @@ def infer_value_hints(
     Schema-driven value extraction with punctuation cleanup.
 
     When include_placeholders=False, only values explicitly extracted from the
-    query are returned. This is useful for deciding which fields should become
-    active. When include_placeholders=True, fallback demo placeholders are also
-    returned for active/required fields.
+    query are returned. When include_placeholders=True, fallback demo
+    placeholders are also returned for active/required fields.
     """
     hints: Dict[str, Any] = {}
     q = query.strip()
@@ -293,8 +294,6 @@ def infer_value_hints(
     choices = schema.get("choices", {}) or {}
 
     if "state" in types:
-        # Only activate state when the query explicitly talks about state,
-        # or when it is clearly a delete/remove/absent request.
         if " delete " in ql or " remove " in ql or " absent " in ql:
             hints["state"] = "absent"
         elif phrase_in_query(ql, "state"):

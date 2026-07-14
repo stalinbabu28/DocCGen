@@ -33,6 +33,12 @@ evaluation/phase3_corpus_sample/
 evaluation/phase4_backtracking5
 evaluation/phase4_backtracking10
 evaluation/phase4_backtracking100
+evaluation/phase4_backtracking500
+evaluation/phase4_dynamic10
+evaluation/phase4_dynamic200
+evaluation/phase4_dynamic500
+evaluation/debug1
+
 evaluation/retrieval_test/
 
 experiments/

@@ -60,6 +60,26 @@ def _explicit_location_trigger(query: str) -> bool:
     return phrase_in_query(q, "location") or phrase_in_query(q, "region")
 
 
+def _explicit_src_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return (
+        phrase_in_query(q, "from")
+        or phrase_in_query(q, "source")
+        or phrase_in_query(q, "using")
+    )
+
+
+def _explicit_dest_trigger(query: str) -> bool:
+    q = collapse_ws(query)
+    return (
+        phrase_in_query(q, "to")
+        or phrase_in_query(q, "into")
+        or phrase_in_query(q, "dest")
+        or phrase_in_query(q, "destination")
+        or phrase_in_query(q, "target")
+    )
+
+
 @dataclass
 class GrammarState:
     active_fields: List[str]
@@ -84,21 +104,6 @@ def project_schema(schema: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
 
     return projected
 
-def _explicit_src_trigger(query: str) -> bool:
-    q = collapse_ws(query)
-    return phrase_in_query(q, "from") or phrase_in_query(q, "source") or phrase_in_query(q, "using")
-
-
-def _explicit_dest_trigger(query: str) -> bool:
-    q = collapse_ws(query)
-    return (
-        phrase_in_query(q, "to")
-        or phrase_in_query(q, "into")
-        or phrase_in_query(q, "dest")
-        or phrase_in_query(q, "destination")
-        or phrase_in_query(q, "target")
-    )
-
 
 def infer_active_fields(
     query: str,
@@ -107,16 +112,18 @@ def infer_active_fields(
 ) -> GrammarState:
     """
     Conservative semantic trigger pass.
+    Required fields are always active. Optional fields are only activated when
+    there is an explicit signal.
     """
     q = f" {collapse_ws(query)} "
     info_module = is_info_module(module_fqn)
 
-    required = list(schema.get("required", []))
-    optional = list(schema.get("optional", []))
+    required = unique(list(schema.get("required", [])))
+    optional = unique(list(schema.get("optional", [])))
     all_fields = unique(required + [f for f in optional if f not in required])
 
-    active: List[str] = []
-    triggered: List[str] = []
+    active: List[str] = list(required)
+    triggered: List[str] = [f"{f}:required" for f in required]
 
     def add(field: str, reason: str) -> None:
         if field in all_fields and field not in active:
@@ -127,6 +134,8 @@ def infer_active_fields(
         add("state", "delete-trigger")
 
     for field in all_fields:
+        if field in required:
+            continue
         if field == "state":
             continue
 
@@ -141,7 +150,6 @@ def infer_active_fields(
             add(field, "dest-directional-cue")
             continue
 
-        # Boolean fields: do not activate from bare action verbs like "create".
         if t == "bool":
             if field in {"append_tags", "backup", "force", "enabled", "disabled", "validate", "check", "public", "private"}:
                 if any(phrase_in_query(q, p) for p in phrases) and any(cue in q for cue in BOOL_CUES):
@@ -192,10 +200,5 @@ def infer_active_fields(
         elif t == "dict" and any(word in q for word in SPECIAL_DICTISH_WORDS):
             if any(phrase_in_query(q, p) for p in phrases):
                 add(field, "dict-cue")
-
-    if not active:
-        active = [f for f in required if f in all_fields]
-        for f in active:
-            triggered.append(f"{f}:required-fallback")
 
     return GrammarState(active_fields=active, triggered=triggered)
